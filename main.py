@@ -6,6 +6,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 # Load environment variables
+
+#variablshit
 load_dotenv()
 
 # Configure logging
