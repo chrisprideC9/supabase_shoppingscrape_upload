@@ -34,7 +34,7 @@ from ui.components import (
 )
 
 
-def process_excel_file(file_path: str, campaign_id: int, scrape_type_id: int) -> dict:
+def process_excel_file(file_path: str, campaign_id: int, scrape_type_id: int, force_upload: bool = False) -> dict:
     """
     Process an Excel file and insert the data into the database using batch processing.
     
@@ -42,11 +42,12 @@ def process_excel_file(file_path: str, campaign_id: int, scrape_type_id: int) ->
         file_path: Path to the Excel file
         campaign_id: ID of the campaign
         scrape_type_id: ID of the scrape type
+        force_upload: Whether to force upload without checking for duplicates
         
     Returns:
         Statistics about the processing
     """
-    logger.info(f"Processing Excel file for campaign ID: {campaign_id}, scrape type ID: {scrape_type_id}")
+    logger.info(f"Processing Excel file for campaign ID: {campaign_id}, scrape type ID: {scrape_type_id}, force upload: {force_upload}")
     
     # Get database connection
     conn = init_connection()
@@ -132,7 +133,8 @@ def process_excel_file(file_path: str, campaign_id: int, scrape_type_id: int) ->
                 for i in range(0, len(transformed_records), BATCH_SIZE):
                     batch = transformed_records[i:i+BATCH_SIZE]
                     try:
-                        batch_insert_scrape_data(conn, batch)
+                        # Pass the force_upload parameter to the batch insert function
+                        batch_insert_scrape_data(conn, batch, force_upload)
                         total_inserted += len(batch)
                         logger.debug(f"Inserted batch of {len(batch)} records for sheet: {sheet_name}")
                     except Exception as e:

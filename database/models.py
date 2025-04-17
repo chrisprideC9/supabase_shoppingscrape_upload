@@ -74,77 +74,154 @@ def get_scrape_types(conn) -> List[Dict[str, Any]]:
         return []
 
 
-def batch_insert_scrape_data(conn, scrape_data_batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def batch_insert_scrape_data(conn, scrape_data_batch: List[Dict[str, Any]], force_upload: bool = False) -> List[Dict[str, Any]]:
     """
     Insert multiple scrape data records into the database as a batch,
-    skipping records that already exist.
-    
-    Args:
-        conn: PostgreSQL connection
-        scrape_data_batch: List of dictionaries containing the scrape data to insert
-    
-    Returns:
-        List of inserted data records (with IDs)
+    with efficient duplicate checking.
     """
     if not scrape_data_batch:
         return []
     
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            inserted_ids = []
-            skipped_count = 0
+            # Simple check to see if the table is empty for this campaign
+            if not force_upload:
+                cur.execute("SELECT COUNT(*) FROM scrape_data WHERE campaign_id = %s", (scrape_data_batch[0]['campaign_id'],))
+                count = cur.fetchone()['count']
+                
+                # If the table is empty for this campaign, we don't need duplicate checking
+                if count == 0:
+                    logger.info(f"No existing records for campaign {scrape_data_batch[0]['campaign_id']} - skipping duplicate check")
+                    force_upload = True
             
-            # Insert records one by one, checking for duplicates
-            for record in scrape_data_batch:
-                # Check if a similar record already exists
-                # IMPORTANT: We explicitly check all key identifying factors:
-                # - scrape_type_id (to distinguish different scrape types)
-                # - scrape_date (to distinguish different scrape runs on different dates)
-                # - campaign_id, keyword, and product identification (product_id, title, link)
+            # If force upload is enabled, skip duplicate checking
+            if force_upload:
+                # Proceed directly to insertion
+                records_to_insert = scrape_data_batch
+                skipped_count = 0
+            else:
+                # Get unique campaign IDs, scrape type IDs, and keywords from the batch
+                campaign_ids = set(r['campaign_id'] for r in scrape_data_batch)
+                scrape_type_ids = set(r['scrape_type_id'] for r in scrape_data_batch)
+                keywords = set(r['keyword'] for r in scrape_data_batch)
                 
-                # Format the scrape_date for comparison
-                scrape_date = record.get('scrape_date')
-                if isinstance(scrape_date, str):
-                    # If it's a date string, keep it as is for the DATE() function
-                    date_param = scrape_date
-                else:
-                    # Default to current date if missing
-                    from datetime import datetime
-                    date_param = datetime.now().isoformat()
+                # Extract unique dates (just the date part) and convert to proper date format
+                # This must be fixed to avoid the type cast error
+                dates_list = []
+                for record in scrape_data_batch:
+                    date_str = record.get('scrape_date', '')
+                    if isinstance(date_str, str):
+                        import re
+                        date_match = re.match(r'(\d{4}-\d{2}-\d{2})', date_str)
+                        if date_match:
+                            dates_list.append(date_match.group(1))
                 
-                check_sql = """
-                SELECT id FROM scrape_data 
-                WHERE campaign_id = %(campaign_id)s
-                AND scrape_type_id = %(scrape_type_id)s
-                AND DATE(scrape_date) = DATE(%(scrape_date)s)  -- Compare just the date part
-                AND keyword = %(keyword)s
-                AND (
-                    (product_id = %(product_id)s)
-                    OR (title = %(title)s AND link = %(link)s)
-                )
-                LIMIT 1
+                # Build a query to get all potentially matching records in one go
+                # Modified to use a date-safe comparison
+                fetch_sql = """
+                SELECT 
+                    id, 
+                    campaign_id, 
+                    scrape_type_id, 
+                    DATE(scrape_date) as scrape_date, 
+                    keyword, 
+                    product_id, 
+                    title, 
+                    link
+                FROM scrape_data 
+                WHERE campaign_id = ANY(%s)
+                AND scrape_type_id = ANY(%s)
+                AND keyword = ANY(%s)
                 """
                 
-                check_params = {
-                    'campaign_id': record['campaign_id'],
-                    'scrape_type_id': record['scrape_type_id'],
-                    'scrape_date': date_param,
-                    'keyword': record['keyword'],
-                    'product_id': record['product_id'],
-                    'title': record['title'],
-                    'link': record.get('link', '')
-                }
+                query_params = [
+                    list(campaign_ids), 
+                    list(scrape_type_ids),
+                    list(keywords)
+                ]
                 
-                # Execute check
-                cur.execute(check_sql, check_params)
-                existing = cur.fetchone()
+                # Only add date filtering if we have dates to filter by
+                if dates_list:
+                    date_placeholders = []
+                    for i, date_str in enumerate(dates_list):
+                        date_placeholders.append(f"%s::date")
+                        query_params.append(date_str)
+                    
+                    fetch_sql += f" AND DATE(scrape_date) IN ({', '.join(date_placeholders)})"
                 
-                if existing:
-                    # Skip this record as it already exists
-                    skipped_count += 1
-                    continue
+                # Execute the query
+                cur.execute(fetch_sql, query_params)
                 
-                # Record doesn't exist, so insert it
+                existing_records = cur.fetchall()
+                
+                # Create lookup sets for quick duplicate checking
+                product_id_set = set()
+                title_link_set = set()
+                
+                for rec in existing_records:
+                    # Create a composite key for each existing record
+                    campaign_date_kw_prod = (
+                        rec['campaign_id'], 
+                        rec['scrape_type_id'],
+                        str(rec['scrape_date']), 
+                        rec['keyword'], 
+                        rec['product_id']
+                    )
+                    product_id_set.add(campaign_date_kw_prod)
+                    
+                    # Also check title+link combination
+                    campaign_date_kw_title_link = (
+                        rec['campaign_id'], 
+                        rec['scrape_type_id'],
+                        str(rec['scrape_date']), 
+                        rec['keyword'], 
+                        rec['title'], 
+                        rec.get('link', '')
+                    )
+                    title_link_set.add(campaign_date_kw_title_link)
+                
+                # Filter out duplicates
+                records_to_insert = []
+                skipped_count = 0
+                
+                for record in scrape_data_batch:
+                    # Extract date part for comparison
+                    date_str = record.get('scrape_date', '')
+                    if isinstance(date_str, str):
+                        import re
+                        date_match = re.match(r'(\d{4}-\d{2}-\d{2})', date_str)
+                        date_part = date_match.group(1) if date_match else date_str
+                    else:
+                        date_part = str(date_str)
+                    
+                    # Check if it's a duplicate by product_id
+                    product_key = (
+                        record['campaign_id'], 
+                        record['scrape_type_id'],
+                        date_part, 
+                        record['keyword'], 
+                        record['product_id']
+                    )
+                    
+                    # Check if it's a duplicate by title+link
+                    title_link_key = (
+                        record['campaign_id'], 
+                        record['scrape_type_id'],
+                        date_part, 
+                        record['keyword'], 
+                        record['title'], 
+                        record.get('link', '')
+                    )
+                    
+                    # If neither key exists, it's not a duplicate
+                    if product_key not in product_id_set and title_link_key not in title_link_set:
+                        records_to_insert.append(record)
+                    else:
+                        skipped_count += 1
+            
+            # Now insert all non-duplicate records
+            inserted_ids = []
+            for record in records_to_insert:
                 columns = list(record.keys())
                 placeholders = [f"%({col})s" for col in columns]
                 
@@ -161,7 +238,12 @@ def batch_insert_scrape_data(conn, scrape_data_batch: List[Dict[str, Any]]) -> L
                     inserted_ids.append({"id": result["id"]})
             
             conn.commit()
-            logger.info(f"Inserted {len(inserted_ids)} new records, skipped {skipped_count} existing records")
+            
+            if force_upload:
+                logger.info(f"Force uploaded {len(inserted_ids)} records (bypassed duplicate check)")
+            else:
+                logger.info(f"Inserted {len(inserted_ids)} new records, skipped {skipped_count} existing records")
+                
             return inserted_ids
     except Exception as e:
         conn.rollback()

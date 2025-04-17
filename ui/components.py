@@ -87,8 +87,8 @@ def render_scrape_type_selection(scrape_types: List[Dict[str, Any]]) -> Optional
     return selected_scrape_type
 
 
-def render_file_upload(process_callback: Callable[[str, int, int], Dict[str, Any]], 
-                        campaign_id: int, scrape_type_id: int):
+def render_file_upload(process_callback: Callable[[str, int, int, bool], Dict[str, Any]], 
+                      campaign_id: int, scrape_type_id: int):
     """
     Render the file upload component.
     
@@ -98,6 +98,10 @@ def render_file_upload(process_callback: Callable[[str, int, int], Dict[str, Any
         scrape_type_id: ID of the selected scrape type
     """
     st.subheader("Upload Excel File")
+    
+    # Add checkbox for force upload
+    force_upload = st.checkbox("Force upload (bypass duplicate check)", 
+                              help="Enable this to insert all records without checking for duplicates")
     
     uploaded_file = st.file_uploader("Choose an Excel file", type=["xlsx", "xls"])
     
@@ -121,8 +125,8 @@ def render_file_upload(process_callback: Callable[[str, int, int], Dict[str, Any
                     temp_path = tmp_file.name
                 
                 try:
-                    # Process the file
-                    stats = process_callback(temp_path, campaign_id, scrape_type_id)
+                    # Process the file - passing force_upload parameter
+                    stats = process_callback(temp_path, campaign_id, scrape_type_id, force_upload)
                     
                     # Clean up temp file
                     try:
